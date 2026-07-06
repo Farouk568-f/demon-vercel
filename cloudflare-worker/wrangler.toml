@@ -1,0 +1,6 @@
+name = "vs-stream-proxy"
+main = "vs-stream-proxy.js"
+compatibility_date = "2025-01-01"
+
+[observability]
+enabled = true
