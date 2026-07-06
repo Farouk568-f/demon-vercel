@@ -24,7 +24,7 @@ const HLS_TUNING: Partial<Hls.HlsConfig> = {
 };
 import mpegts from 'mpegts.js';
 import { Movie, Episode, SubtitleTrack, SubtitleSettings, StreamLink } from '../types';
-import VideoEnhancer4K from './videoEnhancer';
+import FlixierCloudEnhancer from './flixierCloudEnhancer';
 import { useProfile } from '../contexts/ProfileContext';
 import { useTranslation } from '../contexts/LanguageContext';
 import { fetchStreamUrl, fetchFromTMDB, analyzeSubtitlesForSkips, streamDubbing, DubbingBatch } from '../services/apiService';
@@ -748,8 +748,8 @@ const VideoPlayer: React.FC<PlayerProps> = ({ item, itemType, initialSeason, ini
     const mpegtsRef = useRef<any>(null);
     const [isEnhancementActive, setIsEnhancementActive] = useState(false);
     const [enhancerCssFallback, setEnhancerCssFallback] = useState(false);
-    const enhancementCanvasRef = useRef<HTMLCanvasElement>(null);
-    const enhancementAnimFrame = useRef<number>(0);
+    const enhanceOverlayARef = useRef<HTMLVideoElement>(null);
+    const enhanceOverlayBRef = useRef<HTMLVideoElement>(null);
 
     const toggleMute = useCallback(() => {
         setIsMuted(prev => !prev);
@@ -834,16 +834,28 @@ const VideoPlayer: React.FC<PlayerProps> = ({ item, itemType, initialSeason, ini
             return;
         }
         const video = videoRef.current;
-        const canvas = enhancementCanvasRef.current;
-        if (!video || !canvas) return;
+        const overlayA = enhanceOverlayARef.current;
+        const overlayB = enhanceOverlayBRef.current;
+        if (!video || !overlayA || !overlayB || !activeStreamUrl) return;
 
-        let enhancer: VideoEnhancer4K | null = null;
+        let enhancer: FlixierCloudEnhancer | null = null;
         try {
-            // True 4K enhancement: GPU bicubic upscale + FSR-style RCAS sharpening.
-            enhancer = new VideoEnhancer4K(video, canvas, () => {
-                // Device/stream can't run the GPU path — degrade to a CSS-filter
-                // enhancement on the video element itself (zero overhead).
-                setEnhancerCssFallback(true);
+            // True AI cloud enhancement (Flixier pipeline): the playing video is
+            // captured ahead in exact 5-second chunks, each chunk is uploaded with
+            // a brand-new session/tokens, enhanced in the cloud, and displayed in
+            // perfect sync 30 seconds after activation. The main player is never
+            // touched — playback always continues normally.
+            enhancer = new FlixierCloudEnhancer({
+                mainVideo: video,
+                overlayA,
+                overlayB,
+                streamUrl: activeStreamUrl,
+                needsProxy: !!needsProxy,
+                onFallback: () => {
+                    // Stream/device can't run the cloud path — degrade to a
+                    // CSS-filter enhancement on the video element (zero overhead).
+                    setEnhancerCssFallback(true);
+                },
             });
             enhancer.start();
             setEnhancerCssFallback(false);
@@ -2003,7 +2015,7 @@ const VideoPlayer: React.FC<PlayerProps> = ({ item, itemType, initialSeason, ini
             <div inert={isChannelListVisible ? true : undefined} className="absolute inset-0 w-full h-full bg-black">
                 <video 
                     ref={videoRef} 
-                    className={`w-full h-full object-contain bg-black ${isEnhancementActive && !enhancerCssFallback ? 'opacity-0' : ''}`} 
+                    className="w-full h-full object-contain bg-black" 
                     style={{ background: 'black', filter: isEnhancementActive && enhancerCssFallback ? 'contrast(1.08) saturate(1.12) brightness(1.03)' : undefined }}
                     playsInline 
                     autoPlay 
@@ -2015,10 +2027,26 @@ const VideoPlayer: React.FC<PlayerProps> = ({ item, itemType, initialSeason, ini
                     ))}
                 </video>
                 
-                <canvas 
-                    ref={enhancementCanvasRef} 
-                    className={`absolute inset-0 w-full h-full object-contain pointer-events-none transition-opacity duration-300 ${isEnhancementActive && !enhancerCssFallback ? 'opacity-100' : 'opacity-0'}`} 
-                />
+                {isEnhancementActive && !enhancerCssFallback && (
+                    <>
+                        <video
+                            ref={enhanceOverlayARef}
+                            muted
+                            playsInline
+                            preload="auto"
+                            className="absolute inset-0 w-full h-full object-contain pointer-events-none transition-opacity duration-300"
+                            style={{ opacity: 0 }}
+                        />
+                        <video
+                            ref={enhanceOverlayBRef}
+                            muted
+                            playsInline
+                            preload="auto"
+                            className="absolute inset-0 w-full h-full object-contain pointer-events-none transition-opacity duration-300"
+                            style={{ opacity: 0 }}
+                        />
+                    </>
+                )}
                 
                 <div 
                     className="absolute left-1/2 -translate-x-1/2 w-full max-w-4xl px-4 text-center pointer-events-none z-10 transition-all duration-200"

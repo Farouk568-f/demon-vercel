@@ -1464,6 +1464,226 @@ app.use((req, res, next) => {
     }
   });
 
+  // ==========================================================
+  // FLIXIER CLOUD VIDEO ENHANCER
+  // Exact Flixier pipeline: anonymous session -> asset register ->
+  // direct S3 upload -> complete -> enhance prediction -> polling.
+  // A BRAND-NEW anonymous session (fresh cookies + XSRF token) is
+  // generated for EVERY uploaded chunk.
+  // ==========================================================
+  const FLIXIER_UA =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
+
+  const flixierHeaders = (cookies: string, xsrfToken: string): Record<string, string> => ({
+    "accept": "application/json, text/plain, */*",
+    "content-type": "application/json;charset=UTF-8",
+    "cookie": cookies,
+    "x-xsrf-token": xsrfToken,
+    "flixier-client-version": "6.0.0",
+    "origin": "https://editor.flixier.com",
+    "referer": "https://editor.flixier.com/video-enhancer/",
+    "user-agent": FLIXIER_UA,
+  });
+
+  // Helper to get a brand-new anonymous guest session from Flixier automatically
+  async function fetchFreshFlixierSession(): Promise<{ cookies: string; xsrfToken: string }> {
+    const cookiesMap: Record<string, string> = {};
+    let xsrfToken = "";
+
+    const updateCookies = (setCookieHeaders: string[]) => {
+      for (const header of setCookieHeaders) {
+        const parts = header.split(";")[0].split("=");
+        if (parts.length >= 2) {
+          const name = parts[0].trim();
+          const value = parts.slice(1).join("=").trim();
+          cookiesMap[name] = value;
+          if (name === "XSRF-TOKEN") {
+            xsrfToken = decodeURIComponent(value);
+          }
+        }
+      }
+    };
+
+    // Step 1: POST to /api/register/anonymous to get initial flixier_session cookie
+    const res1 = await fetch("https://editor.flixier.com/api/register/anonymous", {
+      method: "POST",
+      headers: {
+        "user-agent": FLIXIER_UA,
+        "accept": "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({}),
+    });
+    updateCookies(res1.headers.getSetCookie());
+    const cookieStr1 = Object.entries(cookiesMap).map(([k, v]) => `${k}=${v}`).join("; ");
+
+    // Step 2: GET /api/user with the session cookie to trigger XSRF-TOKEN generation
+    const res2 = await fetch("https://editor.flixier.com/api/user", {
+      headers: {
+        "user-agent": FLIXIER_UA,
+        "cookie": cookieStr1,
+      },
+    });
+    updateCookies(res2.headers.getSetCookie());
+    const cookieStr2 = Object.entries(cookiesMap).map(([k, v]) => `${k}=${v}`).join("; ");
+
+    // Step 3: POST to /api/register/anonymous with cookies + x-xsrf-token to finalize
+    const res3 = await fetch("https://editor.flixier.com/api/register/anonymous", {
+      method: "POST",
+      headers: {
+        "user-agent": FLIXIER_UA,
+        "cookie": cookieStr2,
+        "x-xsrf-token": xsrfToken,
+        "accept": "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({}),
+    });
+    updateCookies(res3.headers.getSetCookie());
+    const finalCookieStr = Object.entries(cookiesMap).map(([k, v]) => `${k}=${v}`).join("; ");
+
+    return { cookies: finalCookieStr, xsrfToken };
+  }
+
+  // Fully automated upload + predict pipeline for a single 5-second chunk.
+  // Fresh tokens + new session on EVERY upload.
+  app.post(
+    "/api/flixier/enhance-chunk",
+    express.raw({ type: () => true, limit: "12mb" }),
+    async (req, res) => {
+      try {
+        const fileBuffer: Buffer = req.body;
+        if (!fileBuffer || !fileBuffer.length) {
+          return res.status(400).json({ error: "No video chunk was uploaded." });
+        }
+
+        const scale = Number(req.query.scale) || 2;
+        const model = (req.query.model as string) || "anime4k-v4-b+b";
+        const trimDuration = Number(req.query.trimDuration) || 5;
+
+        // 1. ALWAYS acquire a fresh anonymous session (new tokens every upload)
+        const session = await fetchFreshFlixierSession();
+        const cookies = session.cookies;
+        const xsrfToken = session.xsrfToken;
+
+        // 2. Register asset with Flixier API
+        const md5Hash = crypto.createHash("md5").update(fileBuffer).digest("hex");
+        const assetUuid = crypto.randomUUID();
+        const registerPayload = {
+          name: `chunk-${Date.now()}.mp4`,
+          type: "video/mp4",
+          size: fileBuffer.length,
+          uuid: assetUuid,
+          folder: "",
+          fileid: md5Hash,
+          cached: 1,
+          duration: 15,
+          width: 1280,
+          height: 720,
+        };
+
+        const registerRes = await fetch("https://editor.flixier.com/api/assets", {
+          method: "POST",
+          headers: flixierHeaders(cookies, xsrfToken),
+          body: JSON.stringify(registerPayload),
+        });
+        if (!registerRes.ok) {
+          const errText = await registerRes.text();
+          throw new Error(`Asset registration failed with status ${registerRes.status}: ${errText}`);
+        }
+        const registerData: any = await registerRes.json();
+        const uploadParams = registerData.upload_params;
+        if (!uploadParams || !uploadParams.fields || !uploadParams.url) {
+          throw new Error("Asset registration response did not contain S3 pre-signed upload parameters.");
+        }
+
+        // 3. Direct S3 multi-part form upload
+        const s3FormData = new FormData();
+        for (const [key, value] of Object.entries(uploadParams.fields)) {
+          s3FormData.append(key, value as string);
+        }
+        s3FormData.append("file", new Blob([fileBuffer], { type: "video/mp4" }), registerPayload.name);
+
+        const s3UploadRes = await fetch(uploadParams.url, {
+          method: "POST",
+          body: s3FormData,
+        });
+        if (!s3UploadRes.ok) {
+          const s3Error = await s3UploadRes.text();
+          throw new Error(`Direct S3 video binary upload failed: ${s3Error}`);
+        }
+
+        // 4. Signal Flixier that the direct upload is finalized
+        const completeRes = await fetch(`https://editor.flixier.com/api/assets/${assetUuid}/complete`, {
+          method: "POST",
+          headers: flixierHeaders(cookies, xsrfToken),
+          body: JSON.stringify({ bitrate: 2000000, duration: 15.0, cached: 1 }),
+        });
+        if (!completeRes.ok) {
+          const errText = await completeRes.text();
+          throw new Error(`Asset completion signaling failed: ${errText}`);
+        }
+
+        // 5. Trigger the video enhancement prediction (5 seconds exactly)
+        const predictPayload = {
+          asset_id: assetUuid,
+          scale: isNaN(Number(scale)) ? scale : Number(scale),
+          processor: "libplacebo",
+          model: model,
+          trim_start: 0,
+          trim_duration: trimDuration,
+        };
+        const predictRes = await fetch("https://editor.flixier.com/api/predictions/enhance-video", {
+          method: "POST",
+          headers: flixierHeaders(cookies, xsrfToken),
+          body: JSON.stringify(predictPayload),
+        });
+        if (!predictRes.ok) {
+          const errText = await predictRes.text();
+          throw new Error(`Neural enhancement prediction failed: ${errText}`);
+        }
+        const predictData: any = await predictRes.json();
+
+        res.json({
+          success: true,
+          predictionId: predictData.id,
+          assetId: assetUuid,
+          sessionCookies: cookies,
+          sessionXsrfToken: xsrfToken,
+        });
+      } catch (err: any) {
+        console.error("[Flixier] Enhance-chunk pipeline error:", err?.message || err);
+        res.status(500).json({ error: err?.message || "Automatic pipeline process failed." });
+      }
+    }
+  );
+
+  // Proxy route to poll a Flixier prediction status
+  app.post("/api/flixier/prediction-status", async (req, res) => {
+    const { id, cookies, xsrfToken } = req.body || {};
+    if (!id) return res.status(400).json({ error: "Missing prediction id" });
+    try {
+      const headers: Record<string, string> = {
+        "accept": "application/json, text/plain, */*",
+        "flixier-client-version": "6.0.0",
+        "origin": "https://editor.flixier.com",
+        "referer": "https://editor.flixier.com/video-enhancer/",
+        "user-agent": FLIXIER_UA,
+      };
+      if (cookies) headers["cookie"] = cookies;
+      if (xsrfToken) headers["x-xsrf-token"] = xsrfToken;
+
+      const response = await fetch(`https://editor.flixier.com/api/predictions/${encodeURIComponent(id)}`, {
+        method: "GET",
+        headers,
+      });
+      const data = await response.json();
+      res.status(response.status).json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: error?.message || "Failed to fetch status" });
+    }
+  });
+
   // Vite middleware for development vs static serve for production
   async function startServer() {
     if (process.env.NODE_ENV !== "production" && !process.env.VERCEL) {
